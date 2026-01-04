@@ -127,31 +127,71 @@ export async function POST(request) {
     }
 }
 
+// Known USDT contract addresses (lowercase)
+const USDT_CONTRACTS = {
+    '0xdac17f958d2ee523a2206206994597c13d831ec7': 'USDT', // ETH
+    '0x55d398326f99059ff775485246999027b3197955': 'USDT', // BSC
+    'es9vmfrzacermjfrf4h2fyd4kconky11mcce8benwnYb': 'USDT', // SOL
+};
+
 async function processWebhook(payload, redis) {
     // Log full payload for debugging
     console.log('Processing payload:', JSON.stringify(payload, null, 2));
     
-    // Tatum ADDRESS_EVENT can have various structures
-    // Extract all possible fields
-    const txId = payload.txId || payload.transactionId || payload.hash;
-    const address = payload.address || payload.to;
-    const amount = payload.amount || payload.value;
-    const chain = payload.chain || payload.network;
-    const type = payload.type;
-    const asset = payload.asset || payload.tokenSymbol || payload.currency;
-    const blockNumber = payload.blockNumber || payload.block;
-    const counterAddress = payload.counterAddress || payload.from;
+    // Tatum ADDRESS_EVENT can have various structures depending on:
+    // - Native vs Token transfer
+    // - Chain type (EVM vs UTXO vs Solana)
+    // - Tatum API version
     
-    console.log(`Parsed: txId=${txId}, address=${address}, amount=${amount}, chain=${chain}, type=${type}, asset=${asset}`);
+    // Extract all possible fields from different payload formats
+    const txId = payload.txId || payload.transactionId || payload.hash || payload.txHash;
+    const address = payload.address || payload.to || payload.subscriptionType?.address;
+    const chain = payload.chain || payload.network || payload.blockchain;
+    const type = payload.type || payload.transactionType;
+    const blockNumber = payload.blockNumber || payload.block || payload.height;
+    const counterAddress = payload.counterAddress || payload.from || payload.sender;
+    
+    // Amount handling - can be in different fields
+    let amount = payload.amount || payload.value;
+    
+    // Asset/Token handling - Tatum can send contract address or symbol
+    let asset = payload.asset || payload.tokenSymbol || payload.currency || payload.token;
+    const contractAddress = payload.contractAddress || payload.tokenAddress || payload.tokenContractAddress;
+    
+    // If we have a contract address, check if it's USDT
+    if (contractAddress) {
+        const normalizedContract = contractAddress.toLowerCase();
+        if (USDT_CONTRACTS[normalizedContract]) {
+            asset = 'USDT';
+            console.log(`Identified USDT from contract: ${contractAddress}`);
+        }
+    }
+    
+    // Check if asset itself is a contract address
+    if (asset && asset.startsWith('0x') && asset.length === 42) {
+        const normalizedAsset = asset.toLowerCase();
+        if (USDT_CONTRACTS[normalizedAsset]) {
+            asset = 'USDT';
+            console.log(`Identified USDT from asset field: ${asset}`);
+        }
+    }
+    
+    console.log(`Parsed: txId=${txId}, address=${address}, amount=${amount}, chain=${chain}, type=${type}, asset=${asset}, contract=${contractAddress}`);
     
     // Validate required fields
-    if (!txId || !address || !amount) {
-        console.log('Skip: Missing required fields (txId, address, or amount)');
+    if (!txId || !address) {
+        console.log('Skip: Missing txId or address');
         return;
     }
     
-    // Skip outgoing transactions
-    if (type === 'outgoing' || type === 'native_outgoing' || type === 'token_outgoing') {
+    if (!amount || parseFloat(amount) <= 0) {
+        console.log(`Skip: Invalid amount: ${amount}`);
+        return;
+    }
+    
+    // Skip outgoing transactions - check various type formats
+    const outgoingTypes = ['outgoing', 'native_outgoing', 'token_outgoing', 'out', 'send', 'withdrawal'];
+    if (type && outgoingTypes.includes(type.toLowerCase())) {
         console.log('Skip: outgoing transaction');
         return;
     }

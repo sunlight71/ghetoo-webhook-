@@ -1,39 +1,35 @@
 import { createClient } from 'redis';
 import { NextResponse } from 'next/server';
 
-// Redis client singleton
-let redisClient = null;
-let isConnecting = false;
-
+// Create fresh Redis connection for each request (Vercel serverless)
 async function getRedis() {
-    if (redisClient?.isOpen) return redisClient;
-    if (isConnecting) {
-        await new Promise(r => setTimeout(r, 100));
-        return redisClient;
-    }
-    
     const host = process.env.REDIS_HOST;
     const password = process.env.REDIS_PASSWORD;
     const port = process.env.REDIS_PORT || '6379';
     
+    console.log(`Redis config: host=${host ? 'SET' : 'MISSING'}, port=${port}, password=${password ? 'SET' : 'MISSING'}`);
+    
     if (!host || !password) {
-        console.log('Redis not configured');
+        console.error('❌ Redis env vars not configured!');
         return null;
     }
     
     try {
-        isConnecting = true;
-        redisClient = createClient({
+        const client = createClient({
             password,
-            socket: { host, port: parseInt(port) }
+            socket: { 
+                host, 
+                port: parseInt(port),
+                connectTimeout: 10000
+            }
         });
-        redisClient.on('error', (err) => console.log('Redis:', err.message));
-        await redisClient.connect();
-        isConnecting = false;
-        return redisClient;
+        
+        client.on('error', (err) => console.error('Redis error:', err.message));
+        await client.connect();
+        console.log('✅ Redis connected');
+        return client;
     } catch (error) {
-        isConnecting = false;
-        console.error('Redis connect failed:', error.message);
+        console.error('❌ Redis connect failed:', error.message);
         return null;
     }
 }
@@ -75,104 +71,144 @@ async function sendTelegram(chatId, text) {
     }
 }
 
-// Health check
+// Health check - also tests Redis connection
 export async function GET() {
+    let redisStatus = 'not tested';
+    try {
+        const redis = await getRedis();
+        if (redis) {
+            redisStatus = 'connected';
+            await redis.disconnect();
+        } else {
+            redisStatus = 'failed - check env vars';
+        }
+    } catch (e) {
+        redisStatus = `error: ${e.message}`;
+    }
+    
     return NextResponse.json({
         status: 'ok',
         service: 'deposit-webhook',
+        redis: redisStatus,
+        env: {
+            REDIS_HOST: process.env.REDIS_HOST ? 'SET' : 'MISSING',
+            REDIS_PORT: process.env.REDIS_PORT || '6379',
+            REDIS_PASSWORD: process.env.REDIS_PASSWORD ? 'SET' : 'MISSING',
+            TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN ? 'SET' : 'MISSING',
+            DEPOSIT_CHATID: process.env.DEPOSIT_CHATID ? 'SET' : 'MISSING'
+        },
         time: new Date().toISOString()
     });
 }
 
 // Tatum webhook handler
 export async function POST(request) {
+    let redis = null;
     try {
-        // Must read body before returning - Vercel terminates after response
         const payload = await request.json();
-        console.log('📥 Webhook:', JSON.stringify(payload));
+        console.log('📥 Webhook received:', JSON.stringify(payload));
         
-        // Process synchronously to ensure completion
-        await processWebhook(payload);
+        redis = await getRedis();
+        if (!redis) {
+            console.error('❌ Cannot process - Redis not available');
+            return NextResponse.json({ received: true, error: 'Redis unavailable' });
+        }
         
-        return NextResponse.json({ received: true });
+        await processWebhook(payload, redis);
+        
+        return NextResponse.json({ received: true, processed: true });
     } catch (error) {
-        console.error('Webhook POST error:', error);
+        console.error('❌ Webhook POST error:', error.message);
         return NextResponse.json({ received: true, error: error.message });
+    } finally {
+        if (redis) {
+            try { await redis.disconnect(); } catch (e) {}
+        }
     }
 }
 
-async function processWebhook(payload) {
+async function processWebhook(payload, redis) {
+    // Log full payload for debugging
+    console.log('Processing payload:', JSON.stringify(payload, null, 2));
+    
+    // Tatum ADDRESS_EVENT can have various structures
+    // Extract all possible fields
+    const txId = payload.txId || payload.transactionId || payload.hash;
+    const address = payload.address || payload.to;
+    const amount = payload.amount || payload.value;
+    const chain = payload.chain || payload.network;
+    const type = payload.type;
+    const asset = payload.asset || payload.tokenSymbol || payload.currency;
+    const blockNumber = payload.blockNumber || payload.block;
+    const counterAddress = payload.counterAddress || payload.from;
+    
+    console.log(`Parsed: txId=${txId}, address=${address}, amount=${amount}, chain=${chain}, type=${type}, asset=${asset}`);
+    
+    // Validate required fields
+    if (!txId || !address || !amount) {
+        console.log('Skip: Missing required fields (txId, address, or amount)');
+        return;
+    }
+    
+    // Skip outgoing transactions
+    if (type === 'outgoing' || type === 'native_outgoing' || type === 'token_outgoing') {
+        console.log('Skip: outgoing transaction');
+        return;
+    }
+    
+    // DUPLICATE CHECK
+    const txKey = `ghetto:processed_tx:${txId}`;
+    const exists = await redis.exists(txKey);
+    if (exists) {
+        console.log(`Skip: TX ${txId} already processed`);
+        return;
+    }
+    
+    // Lock TX to prevent race conditions
+    const lockKey = `ghetto:tx_lock:${txId}`;
+    const locked = await redis.set(lockKey, '1', { NX: true, EX: 60 });
+    if (!locked) {
+        console.log(`Skip: TX ${txId} being processed`);
+        return;
+    }
+    
     try {
-        // Tatum v4 ADDRESS_EVENT payload structure
-        // Can have: address, txId, blockNumber, asset, amount, chain, type (incoming/outgoing)
-        // OR for native: address, txId, blockNumber, amount, chain, counterAddress
-        const { 
-            txId, 
-            address, 
-            amount, 
-            chain, 
-            type,
-            asset,           // Token symbol if token transfer
-            counterAddress,  // Sender address for native transfers
-            blockNumber 
-        } = payload;
-        
-        console.log(`Processing: chain=${chain}, address=${address}, amount=${amount}, type=${type}, asset=${asset}`);
-        
-        // Determine if incoming - check type or counterAddress
-        // If type is present, use it; otherwise check if counterAddress exists (incoming native)
-        const isIncoming = type === 'incoming' || (counterAddress && !type);
-        
-        if (!isIncoming && type === 'outgoing') {
-            console.log('Skip: outgoing transaction');
-            return;
+        // Find user by address (try both cases)
+        let userId = await redis.get(`ghetto:tatum:address:${address.toLowerCase()}`);
+        if (!userId) {
+            userId = await redis.get(`ghetto:tatum:address:${address}`);
         }
         
-        const redis = await getRedis();
-        if (!redis) {
-            console.error('No Redis connection');
-            return;
-        }
-        
-        // DUPLICATE CHECK - Critical!
-        const txKey = `ghetto:processed_tx:${txId}`;
-        const exists = await redis.exists(txKey);
-        if (exists) {
-            console.log(`Skip: TX ${txId} already processed`);
-            return;
-        }
-        
-        // Lock this TX immediately to prevent race conditions
-        const locked = await redis.set(`ghetto:tx_lock:${txId}`, '1', { NX: true, EX: 60 });
-        if (!locked) {
-            console.log(`Skip: TX ${txId} being processed by another request`);
-            return;
-        }
-        
-        // Get user from address
-        const userId = await redis.get(`ghetto:tatum:address:${address.toLowerCase()}`);
         if (!userId) {
             console.log(`Skip: No user for address ${address}`);
-            await redis.del(`ghetto:tx_lock:${txId}`);
+            // List all registered addresses for debugging
+            const keys = await redis.keys('ghetto:tatum:address:*');
+            console.log(`Registered addresses: ${keys.length}`);
             return;
         }
         
-        // Determine symbol - asset is token symbol, chain is native
-        let symbol = asset || chain;
-        const chainMap = { 'ETH': 'ETH', 'BSC': 'BNB', 'BTC': 'BTC', 'LTC': 'LTC', 'SOL': 'SOL' };
-        if (!asset) symbol = chainMap[chain] || chain;
+        console.log(`Found user ${userId} for address ${address}`);
+        
+        // Determine symbol
+        let symbol = asset;
+        if (!symbol || symbol === chain) {
+            const chainMap = { 'ETH': 'ETH', 'BSC': 'BNB', 'BTC': 'BTC', 'LTC': 'LTC', 'SOL': 'SOL', 'ethereum': 'ETH', 'bsc': 'BNB' };
+            symbol = chainMap[chain] || chain;
+        }
         
         // Parse amount
-        const depositAmount = parseFloat(amount) || 0;
-        if (depositAmount <= 0) {
-            console.log('Skip: zero amount');
-            await redis.del(`ghetto:tx_lock:${txId}`);
+        const depositAmount = parseFloat(amount);
+        if (!depositAmount || depositAmount <= 0) {
+            console.log(`Skip: Invalid amount ${amount}`);
             return;
         }
         
-        // Get USD value
+        // Get USD price
         const price = await getPrice(symbol);
+        console.log(`Price for ${symbol}: $${price}`);
+        
         const usdAmount = price ? (depositAmount * price).toFixed(2) : '0.00';
+        console.log(`Deposit value: ${depositAmount} ${symbol} = $${usdAmount}`);
         
         // Check minimum deposit
         const minSetting = await redis.hGet('ghetto:deposit_withdraw_settings', 'min_deposit_usd');
@@ -184,18 +220,18 @@ async function processWebhook(payload) {
                 userId, amount: depositAmount.toString(), symbol, usdAmount,
                 status: 'below_minimum', processedAt: new Date().toISOString()
             });
-            await redis.del(`ghetto:tx_lock:${txId}`);
             return;
         }
         
-        // Get user data
+        // Get user data and update balance
         const userKey = `ghetto:users:${userId}`;
         const userData = await redis.hGetAll(userKey);
         const firstName = userData?.first_name || 'User';
         const currentBalance = parseFloat(userData?.balance || '0');
         const newBalance = (currentBalance + parseFloat(usdAmount)).toFixed(2);
         
-        // Update balance
+        console.log(`Updating balance: $${currentBalance} + $${usdAmount} = $${newBalance}`);
+        
         await redis.hSet(userKey, 'balance', newBalance);
         
         // Mark TX as processed
@@ -205,43 +241,38 @@ async function processWebhook(payload) {
             symbol,
             usdAmount,
             newBalance,
-            chain,
+            chain: chain || '',
             blockNumber: blockNumber?.toString() || '',
+            status: 'completed',
             processedAt: new Date().toISOString()
         });
         
-        // Remove lock
-        await redis.del(`ghetto:tx_lock:${txId}`);
-        
-        // Notify user
+        // Send notifications
         const userMsg = `💰 *Deposit Confirmed!*\n\n` +
             `💵 Amount: \`${depositAmount} ${symbol}\`\n` +
             `💲 Value: \`$${usdAmount} USD\`\n` +
-            `🔗 Network: \`${chain}\`\n` +
-            `📦 Block: \`${blockNumber || 'Confirmed'}\`\n\n` +
+            `🔗 Network: \`${chain || 'Unknown'}\`\n\n` +
             `💳 New Balance: \`$${newBalance}\`\n\n` +
             `🏷️ TX: \`${txId}\``;
         
         await sendTelegram(userId, userMsg);
         
-        // Notify admin
         const adminChatId = process.env.DEPOSIT_CHATID;
         if (adminChatId) {
             const adminMsg = `💰 *New Deposit*\n\n` +
                 `👤 User: ${firstName} (\`${userId}\`)\n` +
                 `💵 Amount: \`${depositAmount} ${symbol}\`\n` +
                 `💲 Value: \`$${usdAmount} USD\`\n` +
-                `🔗 Network: \`${chain}\`\n` +
-                `📦 Block: \`${blockNumber || 'Confirmed'}\`\n` +
+                `🔗 Network: \`${chain || 'Unknown'}\`\n` +
                 `💳 New Balance: \`$${newBalance}\`\n\n` +
                 `🏷️ TX: \`${txId}\``;
             
             await sendTelegram(adminChatId, adminMsg);
         }
         
-        console.log(`✅ Deposit: ${depositAmount} ${symbol} ($${usdAmount}) → User ${userId}`);
+        console.log(`✅ Deposit complete: ${depositAmount} ${symbol} ($${usdAmount}) → User ${userId}`);
         
-    } catch (error) {
-        console.error('Webhook error:', error);
+    } finally {
+        await redis.del(lockKey);
     }
 }

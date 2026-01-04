@@ -86,23 +86,45 @@ export async function GET() {
 
 // Tatum webhook handler
 export async function POST(request) {
-    // Respond immediately (Tatum retries on slow response)
-    const responsePromise = processWebhook(request);
-    
-    // Return 200 immediately
-    return NextResponse.json({ received: true });
-}
-
-async function processWebhook(request) {
     try {
+        // Must read body before returning - Vercel terminates after response
         const payload = await request.json();
         console.log('📥 Webhook:', JSON.stringify(payload));
         
-        const { txId, address, amount, chain, type, tokenSymbol, blockNumber } = payload;
+        // Process synchronously to ensure completion
+        await processWebhook(payload);
         
-        // Only incoming transactions
-        if (type !== 'incoming') {
-            console.log('Skip: not incoming');
+        return NextResponse.json({ received: true });
+    } catch (error) {
+        console.error('Webhook POST error:', error);
+        return NextResponse.json({ received: true, error: error.message });
+    }
+}
+
+async function processWebhook(payload) {
+    try {
+        // Tatum v4 ADDRESS_EVENT payload structure
+        // Can have: address, txId, blockNumber, asset, amount, chain, type (incoming/outgoing)
+        // OR for native: address, txId, blockNumber, amount, chain, counterAddress
+        const { 
+            txId, 
+            address, 
+            amount, 
+            chain, 
+            type,
+            asset,           // Token symbol if token transfer
+            counterAddress,  // Sender address for native transfers
+            blockNumber 
+        } = payload;
+        
+        console.log(`Processing: chain=${chain}, address=${address}, amount=${amount}, type=${type}, asset=${asset}`);
+        
+        // Determine if incoming - check type or counterAddress
+        // If type is present, use it; otherwise check if counterAddress exists (incoming native)
+        const isIncoming = type === 'incoming' || (counterAddress && !type);
+        
+        if (!isIncoming && type === 'outgoing') {
+            console.log('Skip: outgoing transaction');
             return;
         }
         
@@ -135,10 +157,10 @@ async function processWebhook(request) {
             return;
         }
         
-        // Determine symbol
-        let symbol = tokenSymbol || chain;
+        // Determine symbol - asset is token symbol, chain is native
+        let symbol = asset || chain;
         const chainMap = { 'ETH': 'ETH', 'BSC': 'BNB', 'BTC': 'BTC', 'LTC': 'LTC', 'SOL': 'SOL' };
-        if (!tokenSymbol) symbol = chainMap[chain] || chain;
+        if (!asset) symbol = chainMap[chain] || chain;
         
         // Parse amount
         const depositAmount = parseFloat(amount) || 0;

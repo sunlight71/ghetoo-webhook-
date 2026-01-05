@@ -99,9 +99,16 @@ export async function GET(request) {
                 };
             } else if (debug === '1') {
                 const allKeys = await redis.keys('ghetto:tatum:address:*');
+                const webhookLogs = await redis.keys('ghetto:webhook_debug:*');
+                const recentPayloads = [];
+                for (const k of webhookLogs.slice(-5)) {
+                    const data = await redis.get(k);
+                    recentPayloads.push({ key: k, payload: JSON.parse(data || '{}') });
+                }
                 debugInfo = {
                     totalAddresses: allKeys.length,
-                    addresses: allKeys.slice(0, 10)
+                    addresses: allKeys.slice(0, 10),
+                    recentWebhooks: recentPayloads
                 };
             }
         } else {
@@ -141,6 +148,10 @@ export async function POST(request) {
             console.error('❌ Cannot process - Redis not available');
             return NextResponse.json({ received: true, error: 'Redis unavailable' });
         }
+        
+        // Store raw payload for debugging (keep last 20)
+        const debugKey = `ghetto:webhook_debug:${Date.now()}`;
+        await redis.set(debugKey, JSON.stringify(payload), { EX: 3600 }); // expires in 1 hour
         
         await processWebhook(payload, redis);
         

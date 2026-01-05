@@ -71,25 +71,53 @@ async function sendTelegram(chatId, text) {
     }
 }
 
-// Health check - also tests Redis connection
-export async function GET() {
+// Health check and debug endpoint
+export async function GET(request) {
+    const url = new URL(request.url);
+    const debug = url.searchParams.get('debug');
+    const address = url.searchParams.get('address');
+    
+    let redis = null;
     let redisStatus = 'not tested';
+    let debugInfo = null;
+    
     try {
-        const redis = await getRedis();
+        redis = await getRedis();
         if (redis) {
             redisStatus = 'connected';
-            await redis.disconnect();
+            
+            // Debug mode - check address mapping
+            if (debug === '1' && address) {
+                const userId = await redis.get(`ghetto:tatum:address:${address.toLowerCase()}`);
+                const allKeys = await redis.keys('ghetto:tatum:address:*');
+                debugInfo = {
+                    address: address,
+                    addressLower: address.toLowerCase(),
+                    userId: userId,
+                    totalAddresses: allKeys.length,
+                    sampleAddresses: allKeys.slice(0, 5)
+                };
+            } else if (debug === '1') {
+                const allKeys = await redis.keys('ghetto:tatum:address:*');
+                debugInfo = {
+                    totalAddresses: allKeys.length,
+                    addresses: allKeys.slice(0, 10)
+                };
+            }
         } else {
             redisStatus = 'failed - check env vars';
         }
     } catch (e) {
         redisStatus = `error: ${e.message}`;
+    } finally {
+        if (redis) try { await redis.disconnect(); } catch(e) {}
     }
     
     return NextResponse.json({
         status: 'ok',
         service: 'deposit-webhook',
         redis: redisStatus,
+        debug: debugInfo,
         env: {
             REDIS_HOST: process.env.REDIS_HOST ? 'SET' : 'MISSING',
             REDIS_PORT: process.env.REDIS_PORT || '6379',
@@ -127,72 +155,77 @@ export async function POST(request) {
     }
 }
 
-// Known USDT contract addresses (lowercase)
-const USDT_CONTRACTS = {
-    '0xdac17f958d2ee523a2206206994597c13d831ec7': 'USDT', // ETH
-    '0x55d398326f99059ff775485246999027b3197955': 'USDT', // BSC
-    'es9vmfrzacermjfrf4h2fyd4kconky11mcce8benwnYb': 'USDT', // SOL
+// Known token contract addresses (lowercase) -> symbol
+const TOKEN_CONTRACTS = {
+    // USDT
+    '0xdac17f958d2ee523a2206206994597c13d831ec7': 'USDT', // ETH USDT
+    '0x55d398326f99059ff775485246999027b3197955': 'USDT', // BSC USDT  
+    'es9vmfrzacermjfrf4h2fyd4kconky11mcce8benwnYb': 'USDT', // SOL USDT
+    // USDC
+    '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 'USDC', // ETH USDC
+    '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 'USDC', // BSC USDC
 };
 
 async function processWebhook(payload, redis) {
-    // Log full payload for debugging
-    console.log('Processing payload:', JSON.stringify(payload, null, 2));
+    console.log('========== WEBHOOK RECEIVED ==========');
+    console.log('Raw payload:', JSON.stringify(payload, null, 2));
     
-    // Tatum ADDRESS_EVENT can have various structures depending on:
-    // - Native vs Token transfer
-    // - Chain type (EVM vs UTXO vs Solana)
-    // - Tatum API version
+    // Extract fields - Tatum ADDRESS_TRANSACTION format:
+    // { subscriptionType, chain, txId, address, amount, tokenSymbol?, blockNumber, type, timestamp }
+    const txId = payload.txId || payload.transactionId || payload.hash;
+    const address = payload.address;
+    const chain = payload.chain;
+    const type = payload.type;
+    const blockNumber = payload.blockNumber;
     
-    // Extract all possible fields from different payload formats
-    const txId = payload.txId || payload.transactionId || payload.hash || payload.txHash;
-    const address = payload.address || payload.to || payload.subscriptionType?.address;
-    const chain = payload.chain || payload.network || payload.blockchain;
-    const type = payload.type || payload.transactionType;
-    const blockNumber = payload.blockNumber || payload.block || payload.height;
-    const counterAddress = payload.counterAddress || payload.from || payload.sender;
+    // Amount - Tatum sends human-readable format
+    const amount = payload.amount;
     
-    // Amount handling - can be in different fields
-    let amount = payload.amount || payload.value;
+    // Token symbol - Tatum sends this for token transfers
+    let symbol = payload.tokenSymbol || payload.asset || payload.currency;
     
-    // Asset/Token handling - Tatum can send contract address or symbol
-    let asset = payload.asset || payload.tokenSymbol || payload.currency || payload.token;
-    const contractAddress = payload.contractAddress || payload.tokenAddress || payload.tokenContractAddress;
+    // If no symbol, it's a native transfer - determine from chain
+    if (!symbol) {
+        const nativeSymbols = {
+            'ETH': 'ETH',
+            'BSC': 'BNB', 
+            'BTC': 'BTC',
+            'LTC': 'LTC',
+            'SOL': 'SOL',
+            'MATIC': 'MATIC',
+            'TRON': 'TRX'
+        };
+        symbol = nativeSymbols[chain] || chain;
+    }
     
-    // If we have a contract address, check if it's USDT
-    if (contractAddress) {
-        const normalizedContract = contractAddress.toLowerCase();
-        if (USDT_CONTRACTS[normalizedContract]) {
-            asset = 'USDT';
-            console.log(`Identified USDT from contract: ${contractAddress}`);
+    // Check if symbol is a contract address and map to token name
+    if (symbol && symbol.startsWith('0x')) {
+        const tokenName = TOKEN_CONTRACTS[symbol.toLowerCase()];
+        if (tokenName) {
+            console.log(`Mapped contract ${symbol} to ${tokenName}`);
+            symbol = tokenName;
         }
     }
     
-    // Check if asset itself is a contract address
-    if (asset && asset.startsWith('0x') && asset.length === 42) {
-        const normalizedAsset = asset.toLowerCase();
-        if (USDT_CONTRACTS[normalizedAsset]) {
-            asset = 'USDT';
-            console.log(`Identified USDT from asset field: ${asset}`);
-        }
-    }
-    
-    console.log(`Parsed: txId=${txId}, address=${address}, amount=${amount}, chain=${chain}, type=${type}, asset=${asset}, contract=${contractAddress}`);
+    console.log(`Parsed: txId=${txId}, address=${address}, amount=${amount}, chain=${chain}, type=${type}, symbol=${symbol}`);
     
     // Validate required fields
-    if (!txId || !address) {
-        console.log('Skip: Missing txId or address');
+    if (!txId) {
+        console.log('❌ Skip: No txId');
         return;
     }
-    
+    if (!address) {
+        console.log('❌ Skip: No address');
+        return;
+    }
     if (!amount || parseFloat(amount) <= 0) {
-        console.log(`Skip: Invalid amount: ${amount}`);
+        console.log(`❌ Skip: Invalid amount: ${amount}`);
         return;
     }
     
-    // Skip outgoing transactions - check various type formats
-    const outgoingTypes = ['outgoing', 'native_outgoing', 'token_outgoing', 'out', 'send', 'withdrawal'];
-    if (type && outgoingTypes.includes(type.toLowerCase())) {
-        console.log('Skip: outgoing transaction');
+    // Skip outgoing transactions
+    if (type === 'outgoing') {
+        console.log('⏭️ Skip: outgoing transaction');
         return;
     }
     
@@ -227,14 +260,7 @@ async function processWebhook(payload, redis) {
             return;
         }
         
-        console.log(`Found user ${userId} for address ${address}`);
-        
-        // Determine symbol
-        let symbol = asset;
-        if (!symbol || symbol === chain) {
-            const chainMap = { 'ETH': 'ETH', 'BSC': 'BNB', 'BTC': 'BTC', 'LTC': 'LTC', 'SOL': 'SOL', 'ethereum': 'ETH', 'bsc': 'BNB' };
-            symbol = chainMap[chain] || chain;
-        }
+        console.log(`✅ Found user ${userId} for address ${address}`);
         
         // Parse amount
         const depositAmount = parseFloat(amount);

@@ -368,6 +368,23 @@ async function processWebhook(payload, redis) {
         
         console.log(`✅ Deposit complete: ${depositAmount} ${symbol} ($${usdAmount}) → User ${userId}`);
         
+        // Queue pending transfer for native coins (bot will process)
+        const nativeCoins = ['ETH', 'BNB', 'SOL', 'BTC', 'LTC'];
+        if (nativeCoins.includes(symbol)) {
+            const transferKey = `ghetto:pending_transfer:${txId}`;
+            await redis.hSet(transferKey, {
+                userId,
+                symbol,
+                depositAddress,
+                amount: depositAmount.toString(),
+                chain: chain || '',
+                txId,
+                status: 'pending',
+                createdAt: new Date().toISOString()
+            });
+            console.log(`📋 Queued pending transfer: ${symbol} for user ${userId}`);
+        }
+        
     } finally {
         await redis.del(lockKey);
     }

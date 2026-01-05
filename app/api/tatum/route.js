@@ -192,30 +192,39 @@ async function processWebhook(payload, redis) {
     // Amount - Tatum sends human-readable format
     const amount = payload.amount;
     
-    // Token symbol - Tatum sends this for token transfers
+    // Token symbol - Tatum sends tokenSymbol for some, asset (contract address) for others
     let symbol = payload.tokenSymbol || payload.asset || payload.currency;
     
-    // If no symbol, it's a native transfer - determine from chain
-    if (!symbol) {
+    // Check if symbol/asset is a contract address and map to token name
+    if (symbol && (symbol.startsWith('0x') || symbol.startsWith('0X'))) {
+        const tokenName = TOKEN_CONTRACTS[symbol.toLowerCase()];
+        if (tokenName) {
+            console.log(`✅ Mapped contract ${symbol} to ${tokenName}`);
+            symbol = tokenName;
+        } else {
+            console.log(`⚠️ Unknown token contract: ${symbol}`);
+            symbol = 'UNKNOWN_TOKEN';
+        }
+    }
+    
+    // If no symbol or it matches chain name, it's a native transfer
+    // Chain names from Tatum: "bsc-mainnet", "ethereum-mainnet", "solana-mainnet", etc.
+    if (!symbol || symbol === chain || symbol === 'BSC' || symbol === 'ETH' || symbol === 'SOL' || symbol === 'LTC' || symbol === 'BTC') {
         const nativeSymbols = {
             'ETH': 'ETH',
-            'BSC': 'BNB', 
+            'BSC': 'BNB',
             'BTC': 'BTC',
             'LTC': 'LTC',
             'SOL': 'SOL',
+            'ethereum-mainnet': 'ETH',
+            'bsc-mainnet': 'BNB',
+            'solana-mainnet': 'SOL',
+            'litecoin-core-mainnet': 'LTC',
+            'bitcoin-mainnet': 'BTC',
             'MATIC': 'MATIC',
             'TRON': 'TRX'
         };
-        symbol = nativeSymbols[chain] || chain;
-    }
-    
-    // Check if symbol is a contract address and map to token name
-    if (symbol && symbol.startsWith('0x')) {
-        const tokenName = TOKEN_CONTRACTS[symbol.toLowerCase()];
-        if (tokenName) {
-            console.log(`Mapped contract ${symbol} to ${tokenName}`);
-            symbol = tokenName;
-        }
+        symbol = nativeSymbols[chain] || nativeSymbols[symbol] || chain;
     }
     
     console.log(`Parsed: txId=${txId}, address=${address}, amount=${amount}, chain=${chain}, type=${type}, symbol=${symbol}`);

@@ -182,12 +182,20 @@ async function processWebhook(payload, redis) {
     console.log('Raw payload:', JSON.stringify(payload, null, 2));
     
     // Extract fields - Tatum ADDRESS_TRANSACTION format:
-    // { subscriptionType, chain, txId, address, amount, tokenSymbol?, blockNumber, type, timestamp }
+    // For native: address = recipient (our address)
+    // For token: address = sender, counterAddress = recipient (our address)
     const txId = payload.txId || payload.transactionId || payload.hash;
-    const address = payload.address;
+    const txType = payload.type; // 'native' or 'token'
     const chain = payload.chain;
-    const type = payload.type;
     const blockNumber = payload.blockNumber;
+    
+    // For token transfers, the deposit address is in counterAddress, not address
+    // For native transfers, the deposit address is in address
+    let depositAddress = payload.address;
+    if (txType === 'token' && payload.counterAddress) {
+        depositAddress = payload.counterAddress;
+        console.log(`Token transfer: using counterAddress ${depositAddress} as deposit address`);
+    }
     
     // Amount - Tatum sends human-readable format
     const amount = payload.amount;
@@ -227,15 +235,15 @@ async function processWebhook(payload, redis) {
         symbol = nativeSymbols[chain] || nativeSymbols[symbol] || chain;
     }
     
-    console.log(`Parsed: txId=${txId}, address=${address}, amount=${amount}, chain=${chain}, type=${type}, symbol=${symbol}`);
+    console.log(`Parsed: txId=${txId}, depositAddress=${depositAddress}, amount=${amount}, chain=${chain}, txType=${txType}, symbol=${symbol}`);
     
     // Validate required fields
     if (!txId) {
         console.log('❌ Skip: No txId');
         return;
     }
-    if (!address) {
-        console.log('❌ Skip: No address');
+    if (!depositAddress) {
+        console.log('❌ Skip: No deposit address');
         return;
     }
     if (!amount || parseFloat(amount) <= 0) {
@@ -244,7 +252,7 @@ async function processWebhook(payload, redis) {
     }
     
     // Skip outgoing transactions
-    if (type === 'outgoing') {
+    if (txType === 'outgoing') {
         console.log('⏭️ Skip: outgoing transaction');
         return;
     }
@@ -266,21 +274,21 @@ async function processWebhook(payload, redis) {
     }
     
     try {
-        // Find user by address (try both cases)
-        let userId = await redis.get(`ghetto:tatum:address:${address.toLowerCase()}`);
+        // Find user by deposit address (try both cases)
+        let userId = await redis.get(`ghetto:tatum:address:${depositAddress.toLowerCase()}`);
         if (!userId) {
-            userId = await redis.get(`ghetto:tatum:address:${address}`);
+            userId = await redis.get(`ghetto:tatum:address:${depositAddress}`);
         }
         
         if (!userId) {
-            console.log(`Skip: No user for address ${address}`);
+            console.log(`❌ Skip: No user for deposit address ${depositAddress}`);
             // List all registered addresses for debugging
             const keys = await redis.keys('ghetto:tatum:address:*');
-            console.log(`Registered addresses: ${keys.length}`);
+            console.log(`Registered addresses: ${keys.length}`, keys.slice(0, 3));
             return;
         }
         
-        console.log(`✅ Found user ${userId} for address ${address}`);
+        console.log(`✅ Found user ${userId} for deposit address ${depositAddress}`);
         
         // Parse amount
         const depositAmount = parseFloat(amount);

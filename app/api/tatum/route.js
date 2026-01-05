@@ -171,7 +171,8 @@ const TOKEN_CONTRACTS = {
     // USDT
     '0xdac17f958d2ee523a2206206994597c13d831ec7': 'USDT', // ETH USDT
     '0x55d398326f99059ff775485246999027b3197955': 'USDT', // BSC USDT  
-    'es9vmfrzacermjfrf4h2fyd4kconky11mcce8benwnYb': 'USDT', // SOL USDT
+    'es9vmfrzacermjfrf4h2fyd4kconky11mcce8benwnYb': 'USDT', // SOL USDT (case-sensitive)
+    'es9vmfrzacermjfrf4h2fyd4kconky11mcce8benwnyb': 'USDT', // SOL USDT (lowercase)
     // USDC
     '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 'USDC', // ETH USDC
     '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 'USDC', // BSC USDC
@@ -204,7 +205,8 @@ async function processWebhook(payload, redis) {
     let symbol = payload.tokenSymbol || payload.asset || payload.currency;
     
     // Check if symbol/asset is a contract address and map to token name
-    if (symbol && (symbol.startsWith('0x') || symbol.startsWith('0X'))) {
+    // EVM addresses start with 0x, Solana addresses are base58 encoded
+    if (symbol && (symbol.startsWith('0x') || symbol.startsWith('0X') || (symbol.length > 30 && !symbol.includes('0x')))) {
         const tokenName = TOKEN_CONTRACTS[symbol.toLowerCase()];
         if (tokenName) {
             console.log(`✅ Mapped contract ${symbol} to ${tokenName}`);

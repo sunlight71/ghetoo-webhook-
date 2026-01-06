@@ -379,10 +379,40 @@ async function processWebhook(payload, redis) {
                 amount: depositAmount.toString(),
                 chain: chain || '',
                 txId,
+                type: 'native',
                 status: 'pending',
                 createdAt: new Date().toISOString()
             });
             console.log(`📋 Queued pending transfer: ${symbol} for user ${userId}`);
+        }
+        
+        // Queue pending transfer for USDT tokens (bot will fund gas + transfer)
+        if (symbol === 'USDT' || symbol === 'USDC') {
+            // Determine the native chain for gas funding
+            const chainMap = {
+                'ethereum-mainnet': 'ETH',
+                'bsc-mainnet': 'BNB', 
+                'solana-mainnet': 'SOL',
+                'ETH': 'ETH',
+                'BSC': 'BNB',
+                'SOL': 'SOL'
+            };
+            const nativeChain = chainMap[chain] || chain;
+            
+            const transferKey = `ghetto:pending_transfer:${txId}`;
+            await redis.hSet(transferKey, {
+                userId,
+                symbol,
+                depositAddress,
+                amount: depositAmount.toString(),
+                chain: chain || '',
+                nativeChain,
+                txId,
+                type: 'token',
+                status: 'pending',
+                createdAt: new Date().toISOString()
+            });
+            console.log(`📋 Queued pending TOKEN transfer: ${symbol} on ${nativeChain} for user ${userId}`);
         }
         
     } finally {
